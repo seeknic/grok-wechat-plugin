@@ -3,18 +3,37 @@ import { spawn } from "node:child_process";
 import fs from "node:fs";
 import { fileURLToPath } from "node:url";
 import {
+  ackInbox,
+  advanceGetUpdatesBuf,
   appendInbox,
+  claimInbox,
+  clearInboxFiles,
   clearPid,
-  drainInbox,
+  enqueueWake,
+  enqueueOrMergeCoalesceWake,
+  filterInboxByBotId,
   findAccount,
+  findMonitorPids,
+  getWakeMeta,
   isAllowed,
+  isMonitorPid,
   listAccounts,
   loadState,
+  markCoalesceWake,
   monitorRunning,
   paths,
+  peekInboxCount,
+  peekPendingCount,
+  pruneMediaOlderThan,
+  recordWakeResult,
   removeAccount,
   resolveWakeForAccount,
+  rotateLogIfHuge,
+  shouldCoalesceWake,
   updateState,
+  updateWakeJobs,
+  wakeQueueDepth,
+  withLock,
   writePid,
 } from "./store.js";
 import {
@@ -22,6 +41,7 @@ import {
   getUpdates,
   loginStart,
   loginWait,
+  markSessionExpired,
   notifyStart,
   notifyStop,
   sendMedia,
@@ -34,6 +54,8 @@ import {
 import { registerShutdownCleanup, touchConnectorActive, connectorAbandoned, runUninstall, uninstallWechat } from "./uninstall.js";
 
 const self = fileURLToPath(import.meta.url);
+const WAKE_BACKOFF_MS = [5_000, 15_000, 60_000, 180_000, 600_000];
+const COALESCE_MS = 2_000;
 
 try {
   fs.mkdirSync("/workspace/.grok-wechat", { recursive: true });
@@ -47,7 +69,6 @@ try {
   if (process.stdin._handle?.setBlocking) process.stdin._handle.setBlocking(true);
 } catch { /* ignore */ }
 
-
 function ok(data) {
   return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
 }
@@ -60,19 +81,37 @@ async function sleep(ms) {
   await new Promise((r) => setTimeout(r, ms));
 }
 
+function reapOrphanMonitors(keepPid = 0) {
+  for (const pid of findMonitorPids()) {
+    if (keepPid && pid === keepPid) continue;
+    if (pid === process.pid) continue;
+    try {
+      process.kill(pid, "SIGTERM");
+    } catch {
+      // ignore
+    }
+  }
+}
+
 function ensureMonitor() {
-  const existing = monitorRunning();
-  if (existing) return { already_running: true, pid: existing };
-  const accounts = listAccounts();
-  if (!accounts.length) return { started: false, reason: "not_logged_in" };
-  const child = spawn(process.execPath, [self, "--monitor"], {
-    detached: true,
-    stdio: "ignore",
-    env: process.env,
+  return withLock("monitor", () => {
+    const existing = monitorRunning();
+    if (existing && isMonitorPid(existing)) {
+      reapOrphanMonitors(existing);
+      return { already_running: true, pid: existing };
+    }
+    const accounts = listAccounts();
+    if (!accounts.length) return { started: false, reason: "not_logged_in" };
+    reapOrphanMonitors(0);
+    const child = spawn(process.execPath, [self, "--monitor"], {
+      detached: true,
+      stdio: "ignore",
+      env: process.env,
+    });
+    child.unref();
+    writePid(child.pid);
+    return { started: true, pid: child.pid, account_count: accounts.length };
   });
-  child.unref();
-  writePid(child.pid);
-  return { started: true, pid: child.pid, account_count: accounts.length };
 }
 
 const accountRefSchema = {
@@ -102,11 +141,12 @@ const tools = {
     },
   },
   wechat_status: {
-    description: "查看所有已绑定账号、allowlist、monitor 是否在跑。",
+    description: "查看账号、global wake、专属助手、allowlist（含 allowlist_open）、inbox/pending、wake 队列、monitor 等。",
     inputSchema: { type: "object", properties: {} },
     handle: async () => {
       const payload = statusPayload();
       payload.monitor_pid = monitorRunning();
+      payload.monitor_ok = Boolean(payload.monitor_pid);
       return ok(payload);
     },
   },
@@ -133,14 +173,18 @@ const tools = {
           s.pendingQrs = [];
           return s;
         });
-        return ok({ logged_out: true, scope: "all" });
+        clearInboxFiles();
+        return ok({ logged_out: true, scope: "all", inbox_cleared: true });
       }
       const before = listAccounts(state).length;
+      const target = findAccount(state, { ilink_bot_id, ilink_user_id });
+      const botId = target?.ilinkBotId || ilink_bot_id || "";
       updateState((s) => removeAccount(s, { ilink_bot_id, ilink_user_id }));
       const after = listAccounts(loadState()).length;
       if (after === before) {
         throw new Error("未找到要登出的账号");
       }
+      if (botId) filterInboxByBotId(botId);
       if (!after && pid) {
         try { process.kill(pid, "SIGTERM"); } catch { /* already gone */ }
         clearPid();
@@ -150,15 +194,37 @@ const tools = {
       return ok({
         logged_out: true,
         scope: "one",
-        ilink_bot_id: ilink_bot_id || undefined,
+        ilink_bot_id: botId || undefined,
         remaining_accounts: after,
       });
     },
   },
   wechat_inbox: {
-    description: "立即取出 monitor 缓存的入站消息（取出后清空）。每条消息带 ilink_bot_id，回复时用同一账号。",
+    description: "取出入站消息并移入 pending（不永久删除）。处理成功后必须调用 wechat_inbox_ack 确认；未 ack 的消息可再次被 wechat_inbox 读到。",
     inputSchema: { type: "object", properties: {} },
-    handle: async () => ok({ messages: drainInbox(), from_monitor: true }),
+    handle: async () => {
+      const messages = claimInbox();
+      return ok({
+        messages,
+        from_monitor: true,
+        pending: true,
+        hint: "处理完后调用 wechat_inbox_ack，传入 message_ids；省略则清空全部 pending。",
+      });
+    },
+  },
+  wechat_inbox_ack: {
+    description: "确认已处理的入站消息：按 message_ids 从 pending 删除；省略 message_ids 则清空全部 pending。",
+    inputSchema: {
+      type: "object",
+      properties: {
+        message_ids: {
+          type: "array",
+          items: { type: ["string", "number"] },
+          description: "要确认删除的 message_id 列表；省略则清空全部 pending",
+        },
+      },
+    },
+    handle: async ({ message_ids }) => ok(ackInbox(message_ids)),
   },
   wechat_send: {
     description: "向微信用户发文本。必须带该用户已缓存的 context_token（对方先发过消息）。Markdown 会转成纯文本。",
@@ -174,7 +240,7 @@ const tools = {
     handle: async ({ text, to_user_id, ilink_bot_id }) => ok(await sendText(to_user_id, text, ilink_bot_id)),
   },
   wechat_send_media: {
-    description: "发送图片/视频/文件。路径是 Grok Bot 电脑上的本地文件。",
+    description: "发送图片/视频/文件。路径须在 /home/box、/workspace 或 media 目录下。",
     inputSchema: {
       type: "object",
       properties: {
@@ -208,13 +274,13 @@ const tools = {
     handle: async () => ok(ensureMonitor()),
   },
   wechat_set_wake: {
-    description: "保存全局入站 webhook（wake.json，权限 600），供当前及后续所有已绑定账号共用。ilink_bot_id 可选；传入时同时写入该账号并仍保留全局配置。",
+    description: "探测成功（HTTP 2xx）后保存全局入站 webhook（wake.json，权限 600）。仅写入全局配置，不把 key 写入 account.json。",
     inputSchema: {
       type: "object",
       properties: {
         url: { type: "string", description: "安装助手 Routine「微信入站唤醒」的 webhook 地址" },
         key: { type: "string", description: "webhook 密钥" },
-        ilink_bot_id: { type: "string", description: "可选，同时写入该已绑定账号；省略则仅设置全局 wake" },
+        ilink_bot_id: { type: "string", description: "可选，仅用于返回信息；密钥不会写入账号" },
       },
       required: ["url", "key"],
     },
@@ -246,7 +312,7 @@ const tools = {
     },
   },
   wechat_approve: {
-    description: "把用户加入 allowlist。allowlist 为空表示接受所有私信；非空则只处理列表内用户。",
+    description: "把用户加入 allowlist。allowlist 为空表示接受所有私信（allowlist_open=true）；非空则只处理列表内用户。",
     inputSchema: {
       type: "object",
       properties: {
@@ -260,11 +326,11 @@ const tools = {
         else if (user_id && !s.allowFrom.includes(user_id)) s.allowFrom.push(user_id);
         return s;
       });
-      return ok({ allow_from: state.allowFrom });
+      return ok({ allow_from: state.allowFrom, allowlist_open: !state.allowFrom.length });
     },
   },
   wechat_uninstall: {
-    description: "完整卸载微信渠道：停止 monitor、删除状态与插件目录、清理自启项；返回 platform_cleanup 与 dedicated_assistants_sidebar_delete（侧栏专属助手名称列表）。",
+    description: "手动完整卸载微信渠道（唯一会删除状态/插件的路径）：停止 monitor、删除状态与插件目录、清理自启项。不会在 MCP 退出或重启时自动触发。",
     inputSchema: { type: "object", properties: {} },
     handle: async () => ok(uninstallWechat()),
   },
@@ -308,7 +374,7 @@ async function onRpc(msg) {
       result: {
         protocolVersion: params?.protocolVersion || "2024-11-05",
         capabilities: { tools: {} },
-        serverInfo: { name: "grok-wechat", version: "1.0.0" },
+        serverInfo: { name: "grok-wechat", version: "1.1.0" },
       },
     };
   }
@@ -328,6 +394,7 @@ async function onRpc(msg) {
 }
 
 function startMcp() {
+  // Auto-uninstall on exit is disabled; registerShutdownCleanup is a no-op.
   registerShutdownCleanup();
   ensureMonitor();
   let buf = Buffer.alloc(0);
@@ -373,6 +440,40 @@ function startMcp() {
   });
 }
 
+function startSafetyKeeper() {
+  const log = (line) => {
+    try {
+      fs.appendFileSync(paths().log, `${new Date().toISOString()} safety-keeper ${line}\n`);
+    } catch { /* ignore */ }
+  };
+  log(`start pid=${process.pid}`);
+  setInterval(() => {
+    touchConnectorActive();
+  }, 60_000);
+  process.on("SIGTERM", () => process.exit(0));
+  process.on("SIGINT", () => process.exit(0));
+  // Stay alive so deferred cleanup (legacy hosts) sees an MCP_MATCH process.
+  setInterval(() => {}, 60_000);
+}
+
+async function postWake(cfg, payload, log) {
+  const res = await fetch(cfg.url, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${cfg.key}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(payload),
+  });
+  const text = await res.text();
+  log(`wake bot=${payload.ilink_bot_id || ""} ${res.status} ${text.slice(0, 180)}`);
+  if (!res.ok) {
+    const err = new Error(`HTTP ${res.status}: ${text.slice(0, 180)}`);
+    err.status = res.status;
+    throw err;
+  }
+  return res.status;
+}
 
 async function wakeAgent(messages, log) {
   if (!messages.length) return;
@@ -390,47 +491,178 @@ async function wakeAgent(messages, log) {
       log(`wake skipped bot=${botId}: no wake config`);
       continue;
     }
+    if (shouldCoalesceWake(botId, COALESCE_MS)) {
+      // First wake already notified the agent; delay+merge follow-ups so we don't
+      // fire a second webhook immediately (duplicate handoffs). Agent still gets
+      // a single catch-up wake after the window for messages that arrived mid-turn.
+      const meta = getWakeMeta();
+      const last = meta.coalesce?.[botId] || Date.now();
+      const delayUntil = last + COALESCE_MS;
+      log(`wake coalesce bot=${botId} (defer until ${delayUntil}, window ${COALESCE_MS}ms)`);
+      enqueueOrMergeCoalesceWake({
+        ilink_bot_id: botId,
+        ilink_user_id: account?.ilinkUserId || batch[0]?.ilink_user_id || "",
+        count: batch.length,
+        from_user_ids: batch.map((m) => m.from_user_id),
+        message_ids: batch.map((m) => m.message_id).filter((x) => x !== undefined && x !== ""),
+        dedicated_assistant_id: account?.dedicatedAssistant?.id || "",
+        dedicated_assistant_name: account?.dedicatedAssistant?.name || "",
+        reason: "coalesce",
+      }, delayUntil);
+      continue;
+    }
+    const payload = {
+      source: "grok-wechat",
+      count: batch.length,
+      from_user_ids: batch.map((m) => m.from_user_id),
+      message_ids: batch.map((m) => m.message_id).filter((x) => x !== undefined && x !== ""),
+      ilink_bot_id: botId,
+      ilink_user_id: account?.ilinkUserId || batch[0]?.ilink_user_id || "",
+      dedicated_assistant_id: account?.dedicatedAssistant?.id || "",
+      dedicated_assistant_name: account?.dedicatedAssistant?.name || "",
+    };
     try {
-      const res = await fetch(cfg.url, {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${cfg.key}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          source: "grok-wechat",
-          count: batch.length,
-          from_user_ids: batch.map((m) => m.from_user_id),
-          ilink_bot_id: botId,
-          ilink_user_id: account?.ilinkUserId || batch[0]?.ilink_user_id || "",
-        }),
-      });
-      const text = await res.text();
-      log(`wake bot=${botId} ${res.status} ${text.slice(0, 180)}`);
+      markCoalesceWake(botId);
+      const status = await postWake(cfg, payload, log);
+      recordWakeResult({ botId, ok: true, status });
     } catch (err) {
-      log(`wake error bot=${botId} ${err instanceof Error ? err.message : String(err)}`);
+      const msg = err instanceof Error ? err.message : String(err);
+      log(`wake error bot=${botId} ${msg}`);
+      recordWakeResult({ botId, ok: false, status: err?.status, error: msg });
+      enqueueWake({
+        ilink_bot_id: botId,
+        ilink_user_id: payload.ilink_user_id,
+        count: batch.length,
+        from_user_ids: payload.from_user_ids,
+        message_ids: payload.message_ids,
+        dedicated_assistant_id: payload.dedicated_assistant_id,
+        dedicated_assistant_name: payload.dedicated_assistant_name,
+        last_error: msg,
+      });
     }
   }
 }
 
+async function flushWakeQueue(log) {
+  const state = loadState();
+  const due = [];
+  updateWakeJobs((rows) => {
+    const now = Date.now();
+    for (const row of rows) {
+      if ((row.next_at || 0) <= now) due.push(row);
+    }
+    return rows;
+  });
+  if (!due.length) return;
+
+  const keep = [];
+  const all = [];
+  updateWakeJobs((rows) => {
+    all.push(...rows);
+    return rows;
+  });
+
+  const dueIds = new Set(due.map((d) => d.id));
+  for (const row of all) {
+    if (!dueIds.has(row.id)) {
+      keep.push(row);
+      continue;
+    }
+    const account = findAccount(state, { ilink_bot_id: row.ilink_bot_id });
+    const cfg = resolveWakeForAccount(account);
+    if (!cfg) {
+      log(`wake-queue drop bot=${row.ilink_bot_id}: no wake config`);
+      continue;
+    }
+    const payload = {
+      source: "grok-wechat",
+      count: row.count || (row.from_user_ids || []).length || 1,
+      from_user_ids: row.from_user_ids || [],
+      message_ids: row.message_ids || [],
+      ilink_bot_id: row.ilink_bot_id || "",
+      ilink_user_id: row.ilink_user_id || "",
+      dedicated_assistant_id: row.dedicated_assistant_id || account?.dedicatedAssistant?.id || "",
+      dedicated_assistant_name: row.dedicated_assistant_name || account?.dedicatedAssistant?.name || "",
+      retry: true,
+      attempts: (row.attempts || 0) + 1,
+    };
+    try {
+      const status = await postWake(cfg, payload, log);
+      recordWakeResult({ botId: row.ilink_bot_id, ok: true, status });
+      log(`wake-queue ok bot=${row.ilink_bot_id} attempt=${payload.attempts}`);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      const attempts = (row.attempts || 0) + 1;
+      const backoff = WAKE_BACKOFF_MS[Math.min(attempts - 1, WAKE_BACKOFF_MS.length - 1)];
+      recordWakeResult({ botId: row.ilink_bot_id, ok: false, status: err?.status, error: msg });
+      if (attempts >= 12) {
+        log(`wake-queue give up bot=${row.ilink_bot_id} after ${attempts}: ${msg}`);
+      } else {
+        keep.push({
+          ...row,
+          attempts,
+          next_at: Date.now() + backoff,
+          last_error: msg,
+        });
+        log(`wake-queue retry bot=${row.ilink_bot_id} attempt=${attempts} in ${backoff}ms`);
+      }
+    }
+  }
+  updateWakeJobs(() => keep);
+}
+
 async function pollAccount(account, log) {
-  const raw = await getUpdates(account);
+  if (account.sessionExpired) {
+    const age = Date.now() - (account.sessionExpiredAt || 0);
+    if (age < 5 * 60_000) {
+      return { messages: [], expired: true, skipped: true };
+    }
+  }
+  const raw = await getUpdates(account, { deferCursor: true });
   if (raw.session_expired) {
     log(`session expired bot=${account.ilinkBotId}`);
+    markSessionExpired(account.ilinkBotId, true);
+    const cfg = resolveWakeForAccount(account);
+    if (cfg) {
+      try {
+        await postWake(cfg, {
+          source: "grok-wechat",
+          error: "session_expired",
+          ilink_bot_id: account.ilinkBotId,
+          ilink_user_id: account.ilinkUserId,
+          count: 0,
+        }, log);
+      } catch (err) {
+        log(`session_expired wake failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
     return { messages: [], expired: true };
   }
   const collected = await collectInbound(raw.msgs || [], account);
   const state = loadState();
   const allowed = collected.messages.filter((m) => isAllowed(state, m.from_user_id));
+  // Append (+fsync) BEFORE advancing cursor
+  if (allowed.length) {
+    appendInbox(allowed);
+  }
+  if (typeof raw.get_updates_buf === "string") {
+    advanceGetUpdatesBuf(account.token, raw.get_updates_buf);
+    account.getUpdatesBuf = raw.get_updates_buf;
+  }
+  if (account.sessionExpired) {
+    markSessionExpired(account.ilinkBotId, false);
+  }
   return { messages: allowed, expired: false };
 }
 
 async function runMonitor() {
+  rotateLogIfHuge();
   const logStream = fs.createWriteStream(paths().log, { flags: "a" });
   const log = (line) => {
     logStream.write(`${new Date().toISOString()} ${line}\n`);
   };
-  log("monitor start");
+  log("monitor start (reliability build)");
+  writePid(process.pid);
   const accounts = listAccounts();
   await Promise.all(accounts.map((a) => notifyStart(a)));
   const onExit = async () => {
@@ -442,11 +674,13 @@ async function runMonitor() {
   process.on("SIGTERM", onExit);
   process.on("SIGINT", onExit);
   let failures = 0;
+  let loops = 0;
   while (true) {
     try {
       if (connectorAbandoned()) {
-        log("connector removed, running uninstall");
-        runUninstall();
+        // Do NOT uninstall. Stop monitor only; state and plugin remain.
+        log("connector abandoned (>30s), stopping monitor without uninstall");
+        clearPid();
         process.exit(0);
       }
       const accountsNow = listAccounts();
@@ -462,9 +696,14 @@ async function runMonitor() {
         await sleep(60_000);
       }
       if (batch.length) {
-        appendInbox(batch);
-        log(`inbox +${batch.length}`);
+        log(`inbox +${batch.length} (pending=${peekPendingCount()} ready=${peekInboxCount()})`);
         await wakeAgent(batch, log);
+      }
+      await flushWakeQueue(log);
+      loops += 1;
+      if (loops % 20 === 0) {
+        rotateLogIfHuge();
+        pruneMediaOlderThan();
       }
     } catch (err) {
       failures += 1;
@@ -474,11 +713,15 @@ async function runMonitor() {
   }
 }
 
-if (process.argv.includes("--monitor")) {
+const argv = process.argv;
+if (argv.includes("--safety-keeper")) {
+  // Intentionally NOT monitor mode. Keeps a process matching MCP_MATCH alive.
+  startSafetyKeeper();
+} else if (argv.includes("--monitor")) {
   runMonitor();
-} else if (process.argv.includes("--ensure-monitor")) {
+} else if (argv.includes("--ensure-monitor")) {
   process.stdout.write(JSON.stringify(ensureMonitor()) + "\n");
-} else if (process.argv.includes("--uninstall")) {
+} else if (argv.includes("--uninstall")) {
   process.stdout.write(`${JSON.stringify(runUninstall({ deferPluginRemoval: false }), null, 2)}\n`);
 } else {
   startMcp();

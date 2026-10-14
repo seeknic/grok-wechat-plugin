@@ -2,9 +2,12 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import {
+  allowlistOpen,
+  assertSendMediaPathAllowed,
   contextFor,
   emptyAccount,
   findAccount,
+  getWakeMeta,
   hasAccountWake,
   hasGlobalWake,
   listAccounts,
@@ -12,16 +15,19 @@ import {
   localTokenList,
   paths,
   peekInboxCount,
+  peekPendingCount,
   rememberContext,
   resolveAccountForPeer,
   requireAccount,
+  safeMediaPath,
   saveGlobalWake,
   saveStateSecure,
   updateState,
   upsertAccount,
+  wakeQueueDepth,
 } from "./store.js";
 
-const CHANNEL_VERSION = "1.0.0";
+const CHANNEL_VERSION = "1.1.0";
 const BOT_AGENT = "Grokbot/1.0.0";
 const ILINK_APP_ID = "bot";
 const ILINK_APP_CLIENT_VERSION = ((1 & 0xff) << 16) | ((0 & 0xff) << 8) | (0 & 0xff);
@@ -29,6 +35,8 @@ const CDN_BASE = "https://novac2c.cdn.weixin.qq.com/c2c";
 const LONG_POLL_MS = 35_000;
 const API_TIMEOUT_MS = 15_000;
 const ERR_SESSION_EXPIRED = -14;
+
+const WEIXIN_CDN_HOST_RE = /(^|\.)((novac2c\.)?cdn\.weixin\.qq\.com|wx\.qlogo\.cn|qpic\.cn|weixin\.qq\.com)$/i;
 
 export const ITEM = { TEXT: 1, IMAGE: 2, VOICE: 3, FILE: 4, VIDEO: 5 };
 export const MSG_TYPE = { USER: 1, BOT: 2 };
@@ -114,6 +122,8 @@ function accountSummary(account) {
     has_wake: hasAccountWake(account),
     dedicated_assistant_id: account.dedicatedAssistant?.id || "",
     dedicated_assistant_name: account.dedicatedAssistant?.name || "",
+    session_expired: Boolean(account.sessionExpired),
+    session_expired_at: account.sessionExpiredAt || 0,
   };
 }
 
@@ -124,6 +134,8 @@ function applyLoginConfirm(state, last) {
     ilinkBotId: last.ilink_bot_id || "",
     ilinkUserId: last.ilink_user_id || "",
     baseUrl: last.baseurl || state.accounts[0]?.baseUrl || emptyAccount().baseUrl,
+    sessionExpired: false,
+    sessionExpiredAt: 0,
   };
   upsertAccount(state, account);
   return account;
@@ -138,8 +150,13 @@ export async function loginStart() {
   const qrcode = data.qrcode;
   const img = data.qrcode_img_content || data.url || "";
   if (!qrcode) throw new Error(`获取二维码失败: ${JSON.stringify(data)}`);
+  // Do not keep huge img blobs in state — only qrcode id + timestamp.
   updateState((s) => {
-    s.pendingQrs.push({ qrcode, img, at: Date.now() });
+    s.pendingQrs = (s.pendingQrs || [])
+      .filter((p) => p.qrcode !== qrcode)
+      .map((p) => ({ qrcode: p.qrcode, at: p.at }))
+      .slice(-5);
+    s.pendingQrs.push({ qrcode, at: Date.now() });
     return s;
   });
   return {
@@ -225,7 +242,24 @@ export async function notifyStop(account) {
   }
 }
 
-export async function getUpdates(account) {
+export function markSessionExpired(ilinkBotId, expired) {
+  if (!ilinkBotId) return;
+  updateState((s) => {
+    const hit = findAccount(s, { ilink_bot_id: ilinkBotId });
+    if (hit) {
+      hit.sessionExpired = Boolean(expired);
+      hit.sessionExpiredAt = expired ? Date.now() : 0;
+    }
+    return s;
+  });
+}
+
+/**
+ * @param {object} account
+ * @param {{ deferCursor?: boolean }} [opts] when deferCursor=true, do not advance getUpdatesBuf yet
+ */
+export async function getUpdates(account, opts = {}) {
+  const deferCursor = Boolean(opts.deferCursor);
   let data;
   try {
     data = await apiPost(
@@ -244,7 +278,7 @@ export async function getUpdates(account) {
   if (data.errcode === ERR_SESSION_EXPIRED || data.ret === ERR_SESSION_EXPIRED) {
     return { ret: data.ret ?? 0, msgs: [], session_expired: true };
   }
-  if (typeof data.get_updates_buf === "string") {
+  if (!deferCursor && typeof data.get_updates_buf === "string") {
     updateState((s) => {
       const hit = findAccount(s, { token: account.token });
       if (hit) hit.getUpdatesBuf = data.get_updates_buf;
@@ -278,18 +312,38 @@ function paddedSize(n) {
   return Math.ceil((n + 1) / 16) * 16;
 }
 
-async function downloadMedia(media, label) {
+function isAllowedCdnUrl(fullUrl) {
+  try {
+    const u = new URL(fullUrl);
+    if (u.protocol !== "https:") return false;
+    return WEIXIN_CDN_HOST_RE.test(u.hostname);
+  } catch {
+    return false;
+  }
+}
+
+function resolveMediaDownloadUrl(media) {
   const param = media?.encrypt_query_param || "";
   const fullUrl = media?.full_url || "";
-  if (!param && !fullUrl) return null;
-  const url = fullUrl || `${CDN_BASE}/download?encrypted_query_param=${encodeURIComponent(param)}`;
+  if (fullUrl) {
+    if (isAllowedCdnUrl(fullUrl)) return fullUrl;
+    // SSRF guard: ignore untrusted full_url and fall back to CDN_BASE when possible
+  }
+  if (param) return `${CDN_BASE}/download?encrypted_query_param=${encodeURIComponent(param)}`;
+  if (fullUrl) throw new Error("拒绝非微信 CDN 的 media.full_url");
+  return null;
+}
+
+async function downloadMedia(media, label) {
+  const url = resolveMediaDownloadUrl(media);
+  if (!url) return null;
   const res = await fetch(url);
   if (!res.ok) throw new Error(`下载媒体失败 ${res.status}`);
   const cipher = Buffer.from(await res.arrayBuffer());
   const key = parseAesKey(media.aes_key);
   const plain = aesEcb(cipher, key, "decrypt");
-  const file = path.join(paths().media, `${Date.now()}-${label}`);
-  fs.writeFileSync(file, plain);
+  const file = safeMediaPath(label);
+  fs.writeFileSync(file, plain, { mode: 0o600 });
   return file;
 }
 
@@ -435,6 +489,9 @@ async function uploadFile(account, to, filePath, mediaType) {
   );
   const uploadUrl = upload.upload_full_url
     || `${CDN_BASE}/upload?encrypted_query_param=${encodeURIComponent(upload.upload_param || "")}&filekey=${encodeURIComponent(filekey)}`;
+  if (upload.upload_full_url && !isAllowedCdnUrl(upload.upload_full_url)) {
+    throw new Error("拒绝非微信 CDN 的 upload_full_url");
+  }
   const res = await fetch(uploadUrl, {
     method: "POST",
     headers: { "Content-Type": "application/octet-stream" },
@@ -466,12 +523,12 @@ export async function sendMedia(toUserId, filePath, kind, caption, ilinkBotId) {
   const to = toUserId;
   const token = contextFor(account, to);
   if (!token) throw new Error("还没有该用户的 context_token，需对方先发一条微信");
-  if (!fs.existsSync(filePath)) throw new Error(`文件不存在: ${filePath}`);
+  const resolved = assertSendMediaPathAllowed(filePath);
   const typeMap = { image: UPLOAD.IMAGE, video: UPLOAD.VIDEO, file: UPLOAD.FILE };
   const mediaType = typeMap[kind];
   if (!mediaType) throw new Error("kind 只能是 image / video / file");
   if (caption) await sendText(to, caption, account.ilinkBotId);
-  const uploaded = await uploadFile(account, to, filePath, mediaType);
+  const uploaded = await uploadFile(account, to, resolved, mediaType);
   const media = mediaRef(uploaded);
   if (kind === "image") {
     return sendItem(account, to, { type: ITEM.IMAGE, image_item: { media, mid_size: uploaded.fileSizeCiphertext } }, token);
@@ -481,7 +538,7 @@ export async function sendMedia(toUserId, filePath, kind, caption, ilinkBotId) {
   }
   return sendItem(account, to, {
     type: ITEM.FILE,
-    file_item: { media, file_name: path.basename(filePath), len: String(uploaded.fileSize) },
+    file_item: { media, file_name: path.basename(resolved), len: String(uploaded.fileSize) },
   }, token);
 }
 
@@ -522,17 +579,34 @@ export async function setTyping(toUserId, on, ilinkBotId) {
 export function statusPayload() {
   const state = loadState();
   const accounts = listAccounts(state);
+  const wakeMeta = getWakeMeta();
+  const open = allowlistOpen(state);
   return {
     logged_in: accounts.length > 0,
     account_count: accounts.length,
     global_wake_configured: hasGlobalWake(),
+    global_wake: hasGlobalWake(),
+    allowlist_open: open,
+    allowlist_warning: open
+      ? "allowlist 为空：当前接受所有私信。建议 wechat_approve 限制对端。"
+      : "",
     accounts: accounts.map((a) => ({
       ...accountSummary(a),
       peers: Object.keys(a.contextTokens || {}),
     })),
     pending_qr_count: state.pendingQrs.length,
     allow_from: state.allowFrom,
+    seen_peers: state.seenPeers || [],
     inbox: peekInboxCount(),
+    inbox_pending: peekPendingCount(),
+    wake_queue_depth: wakeQueueDepth(),
+    last_wake: {
+      status: wakeMeta.last_status,
+      at: wakeMeta.last_at,
+      error: wakeMeta.last_error || "",
+      http_status: wakeMeta.last_http_status ?? null,
+      bot_id: wakeMeta.last_bot_id || "",
+    },
   };
 }
 
@@ -550,24 +624,29 @@ export async function probeWake(url, key) {
     }),
   });
   const text = await res.text();
-  return { status: res.status, body: text.slice(0, 180) };
+  return { status: res.status, ok: res.ok, body: text.slice(0, 180) };
 }
 
 export async function setAccountWake(ilink_bot_id, url, key) {
   if (!url || !key) throw new Error("url 和 key 必填");
   const probe = await probeWake(url, key);
-  saveGlobalWake(url, key);
-  if (ilink_bot_id) {
-    updateState((s) => {
-      const hit = findAccount(s, { ilink_bot_id });
-      if (hit) hit.wake = { url, key };
-      return s;
-    });
+  if (!probe.ok) {
+    throw new Error(`webhook 探测失败 HTTP ${probe.status}: ${probe.body || "非 2xx，未保存 wake 配置"}`);
   }
+  saveGlobalWake(url, key);
+  // Never write webhook key into account.json — global wake.json only.
+  // Strip any legacy account.wake if present.
+  updateState((s) => {
+    for (const a of s.accounts || []) {
+      if (a.wake) a.wake = null;
+    }
+    return s;
+  });
   saveStateSecure(loadState());
   return {
     global_wake_configured: true,
     ilink_bot_id: ilink_bot_id || null,
+    account_wake_written: false,
     probe,
     accounts: listAccounts(loadState()).map(accountSummary),
   };

@@ -162,7 +162,11 @@ function mcpStillRunning() {
       const pid = Number(line.trim());
       if (!Number.isFinite(pid) || pid <= 0) continue;
       const args = sh(`ps -p ${pid} -o args= 2>/dev/null || true`);
-      if (args && !args.includes("--monitor") && !args.includes("--uninstall")) return true;
+      if (!args) continue;
+      // Treat normal MCP hosts and --safety-keeper as "still present".
+      // Exclude --monitor / --uninstall only.
+      if (args.includes("--monitor") || args.includes("--uninstall")) continue;
+      return true;
     }
   } catch {
     // ignore
@@ -172,6 +176,7 @@ function mcpStillRunning() {
 
 let mcpGoneSince = 0;
 
+/** True when no MCP host / safety-keeper has been seen for >30s. Does NOT imply uninstall. */
 export function connectorAbandoned() {
   if (mcpStillRunning()) {
     mcpGoneSince = 0;
@@ -184,8 +189,9 @@ export function connectorAbandoned() {
 export function touchConnectorActive() {
   for (const home of knownStateHomes()) {
     try {
-      fs.mkdirSync(home, { recursive: true });
-      fs.writeFileSync(path.join(home, "connector-active"), `${Date.now()}\n`);
+      fs.mkdirSync(home, { recursive: true, mode: 0o700 });
+      try { fs.chmodSync(home, 0o700); } catch { /* ignore */ }
+      fs.writeFileSync(path.join(home, "connector-active"), `${Date.now()}\n`, { mode: 0o600 });
     } catch {
       // ignore
     }
@@ -214,8 +220,7 @@ crontab -l 2>/dev/null | grep -v -E 'grok-wechat|ensure-monitor\\.sh' | crontab 
 `.trim();
 }
 
-let shutdownHookRegistered = false;
-
+/** Only used by explicit wechat_uninstall / --uninstall. Never from shutdown hooks. */
 export function scheduleDeferredUninstall() {
   try {
     const child = spawn("sh", ["-c", deferredCleanupShell()], {
@@ -230,15 +235,12 @@ export function scheduleDeferredUninstall() {
   }
 }
 
+/**
+ * Auto-uninstall on MCP exit is DISABLED.
+ * Destructive cleanup is only via wechat_uninstall / scripts/uninstall.sh / --uninstall.
+ */
 export function registerShutdownCleanup() {
-  if (shutdownHookRegistered) return;
-  shutdownHookRegistered = true;
-  const run = () => scheduleDeferredUninstall();
-  process.once("SIGTERM", run);
-  process.once("SIGINT", run);
-  process.once("SIGHUP", run);
-  process.stdin?.once("end", run);
-  process.stdin?.once("close", run);
+  // no-op by design
 }
 
 function collectDedicatedAssistants() {

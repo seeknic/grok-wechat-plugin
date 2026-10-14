@@ -6,9 +6,11 @@ description: 用户要在 Grok Bot 里安装、登录、收发、登出或卸载
 
 通过 MCP `grok-wechat` 连接微信个人号。底层是腾讯 iLink（`ilinkai.weixin.qq.com`）。
 
-`微信私信 → monitor 收件箱 → POST 共享 webhook → 安装助手醒来 → wechat_inbox → 按 ilink_bot_id 转交专属助手 → wechat_send / wechat_send_media`
+`微信私信 → monitor 收件箱 → POST 共享 webhook → 安装助手醒来 → wechat_inbox → wechat_inbox_ack → 按 ilink_bot_id 转交专属助手 → wechat_send / wechat_send_media`
 
-任务做完或需要用户拍板：立刻回复。回复前 `wechat_typing`（on），发完关闭。
+可靠性：入站需 ack 才丢弃；wake 失败会入队重试；**仅手动卸载**（无自动清理）。
+
+任务做完或需要用户拍板：立刻回复。较长或需要思考的回复：先 `wechat_typing`（on），发完再关。短句闲聊（大约 40 字以内、无媒体、可立刻发出）可直接 `wechat_send`，跳过 typing，以降低往返延迟。
 
 `base_info.bot_agent = Grokbot/1.0.0`。连接页显示 Grokbot。微信里的「ClawBot」是腾讯产品名。
 
@@ -50,7 +52,8 @@ stdio 支持换行分隔 JSON 与 Content-Length 分帧。
 | `wechat_set_wake` | 保存全局 webhook（url、key 必填）。可选 `ilink_bot_id` 同时写入该账号 |
 | `wechat_set_dedicated_assistant` | 为已绑定账号登记专属助手 `assistant_id` / `assistant_name` |
 | `wechat_status` | 账号列表、`global_wake_configured`、各号专属助手 / peers、allowlist、inbox、monitor |
-| `wechat_inbox` | 立即取出 monitor 缓存的入站消息（取出后清空） |
+| `wechat_inbox` | 取出入站消息并移入 pending（不永久删除）；处理完后必须 `wechat_inbox_ack` |
+| `wechat_inbox_ack` | 确认已处理：按 `message_ids` 从 pending 删除；省略则清空全部 pending |
 | `wechat_send` | 发文本。必填 `text`、`to_user_id`；多账号时带同一 `ilink_bot_id`。Markdown 转纯文本，超 4000 字自动分段 |
 | `wechat_send_media` | 发图片/视频/文件。必填本机 `path`、`kind`（`image` / `video` / `file`）、`to_user_id`；可选 `caption` |
 | `wechat_typing` | 发送或取消「正在输入」。必填 `on`、`to_user_id` |
@@ -62,7 +65,7 @@ stdio 支持换行分隔 JSON 与 Content-Length 分帧。
 
 ## 入站之后
 
-共享入站助手被 webhook 唤醒后 `wechat_inbox`。每条消息含：
+共享入站助手被 webhook 唤醒后 `wechat_inbox`（消息进入 pending，未 ack 可再次读到）。处理成功后调用 `wechat_inbox_ack`。每条消息含：
 
 - `ilink_bot_id` / `ilink_user_id`：本机已绑定账号
 - `from_user_id`：对端
@@ -93,7 +96,7 @@ stdio 支持换行分隔 JSON 与 Content-Length 分帧。
 - 删除 `/home/box/grok-wechat-plugin` 与 `GROK_WECHAT_HOME` / `/home/box/.grok-wechat`（含 `account.json`、`wake.json`、token、inbox、media、pid、log、`ensure-monitor.sh`）
 - 清理 crontab 与 shell 自启项
 
-返回 `dedicated_assistants_sidebar_delete`（绑定期间登记的专属助手名称）。从 Settings 卸掉连接器后，monitor 也会自动完成本机清理。
+返回 `dedicated_assistants_sidebar_delete`（绑定期间登记的专属助手名称）。**不会**在 MCP 退出、宿主重启或连接断开时自动卸载；只有显式 `wechat_uninstall` / `scripts/uninstall.sh` 才会删除状态与插件。
 
 ### 2. 平台清理（安装助手执行）
 
